@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         メルカリ一括値下げ
 // @namespace    usdm.mercari.nesage
-// @version      0.3.0
+// @version      0.4.0
 // @description  出品中の商品を、決めた率・金額で1品ずつ順番に値下げする
 // @match        https://jp.mercari.com/*
 // @updateURL    https://raw.githubusercontent.com/TAKUTO2W/mercari-nesage/main/mercari-nesage.user.js
@@ -23,8 +23,8 @@
     unit: 10,          // 端数をそろえる単位（切り捨て）
     floor: 300,        // これより下げない
     dailyMax: 50,      // 1日の上限件数
-    waitMin: 15,       // 1品ごとの待ち（秒）最小
-    waitMax: 25,       // 最大
+    waitMin: 10,       // 1品ごとの待ち（秒）最小
+    waitMax: 20,       // 最大
   };
   const S = {
     get: (k, d) => { const v = GM_getValue(k); return v === undefined ? d : v; },
@@ -32,6 +32,7 @@
   };
   const settings = () => Object.assign({}, DEFAULTS, S.get('settings', {}));
   const today = () => new Date().toLocaleDateString('sv-SE'); // YYYY-MM-DD
+  const mmdd = (d = new Date()) => `${d.getMonth() + 1}/${d.getDate()}`;
   const doneToday = () => (S.get('dayCount', {})[today()] || 0);
   const addDoneToday = () => { const m = S.get('dayCount', {}); m[today()] = (m[today()] || 0) + 1; S.set('dayCount', m); };
   const log = (msg) => {
@@ -123,28 +124,59 @@
   }
 
   // ---------- 編集画面での値下げ ----------
+  // 値下げが済んだときの記録：ログ・履歴・確認一覧の値段と日付を新しくする
+  function markDone(cur, from, to) {
+    addDoneToday();
+    log(`✅ 完了 ${cur.name}　${from.toLocaleString()}円 → ${to.toLocaleString()}円`);
+    S.set('history', [...S.get('history', []), { id: cur.id, from, to, at: new Date().toISOString() }].slice(-5000));
+    const pv = S.get('preview', []);
+    const row = pv.find((r) => r.id === cur.id);
+    if (row) { row.price = to; row.lastDown = mmdd(); row.checked = false; S.set('preview', pv); }
+  }
+
+  // 保存の途中でページが読み直された場合の後始末（同じ商品を二重に下げないため）
+  function finishPendingIfDone(q, priceNow) {
+    const pd = q.pending;
+    if (!pd) return false;
+    const cur = q.items[q.pos];
+    const onItem = location.pathname === `/item/${pd.id}`;
+    if (cur && cur.id === pd.id && (onItem || priceNow === pd.to)) {
+      delete q.pending;
+      S.set('queue', q);
+      markDone(cur, pd.from, pd.to);
+      next(q, true);
+      return true;
+    }
+    return false;
+  }
+
   async function runOnEditPage() {
     const q = S.get('queue', null);
     if (!q || !q.running) return;
     const cur = q.items[q.pos];
     if (!cur || !location.pathname.includes(`/sell/edit/${cur.id}`)) return;
+    const head = `（${q.pos + 1}/${q.items.length}）${cur.name}`;
 
     const st = settings();
     const input = await waitFor(() => document.querySelector('input[data-testid="price-text-input"], input[name="price"]'));
-    if (!input) { log(`${cur.id} 値段の入力欄が見つからないので止めました`); return stop(); }
+    if (!input) { log(`❌ ${head} 値段の入力欄が見つからないので止めました`); return stop(); }
     await sleep(1000);
-    if (document.querySelector('[data-testid="auction-price-option"]')?.checked) { log(`${cur.id} オークション形式なので飛ばし`); return next(q, false); }
     const actual = yenToNum(input.value);
+    if (finishPendingIfDone(q, actual)) return;
+    if (document.querySelector('[data-testid="auction-price-option"]')?.checked) { log(`⏭ ${head} オークション形式なので飛ばし`); return next(q, false); }
     const target = newPrice(actual, st);
-    if (!target) { log(`${cur.id} ${actual}円 → 下限のため飛ばし`); return next(q, false); }
-    if (q.dry) { log(`[試し] ${cur.id} ${cur.name} ${actual}円 → ${target}円（保存はしていません）`); return next(q, false); }
+    if (!target) { log(`⏭ ${head} ${actual.toLocaleString()}円 → 下限のため飛ばし`); return next(q, false); }
+    if (q.dry) { log(`[試し] ${head}　${actual.toLocaleString()}円 → ${target.toLocaleString()}円（保存はしていません）`); return next(q, false); }
+    log(`▶ 値下げ中 ${head}　今 ${actual.toLocaleString()}円 → ${target.toLocaleString()}円`);
     setReactValue(input, target);
     await sleep(800 + Math.random() * 800);
 
     const btn = document.querySelector('button[data-testid="edit-button"]')
       || [...document.querySelectorAll('button')].find((b) => /^(変更する|更新する)$/.test(b.innerText.trim()));
-    if (!btn) { log(`${cur.id} 「変更する」ボタンが見つからないので止めました`); return stop(); }
+    if (!btn) { log(`❌ ${head} 「変更する」ボタンが見つからないので止めました`); return stop(); }
     await checkPhotoConfirm();
+    q.pending = { id: cur.id, from: actual, to: target };
+    S.set('queue', q);
     btn.click();
     let ok = await waitFor(() => !location.pathname.includes('/sell/edit/'), 8000);
     if (!ok && await checkPhotoConfirm()) { // 押した後に確認欄が出た場合はチェックしてもう一度
@@ -152,10 +184,14 @@
       btn.click();
     }
     ok = ok || await waitFor(() => !location.pathname.includes('/sell/edit/'), 15000);
-    if (!ok) { log(`${cur.id} 保存できたか確認できないので止めました`); return stop(); }
-    addDoneToday();
-    log(`${cur.id} ${cur.name} ${actual}円 → ${target}円`);
-    S.set('history', [...S.get('history', []), { id: cur.id, from: actual, to: target, at: new Date().toISOString() }].slice(-5000));
+    if (!ok) {
+      delete q.pending; S.set('queue', q);
+      log(`❌ ${head} 保存できたか確認できないので止めました（今 ${actual.toLocaleString()}円のまま）`);
+      return stop();
+    }
+    delete q.pending;
+    S.set('queue', q);
+    markDone(cur, actual, target);
     return next(q, true);
   }
 
@@ -163,10 +199,10 @@
     q.pos += 1;
     S.set('queue', q);
     const st = settings();
-    if (q.pos >= q.items.length) { log(`終わりました（${q.items.length}件）`); return stop(); }
+    if (q.pos >= q.items.length) { log(`🏁 全部終わりました（${q.items.length}件）`); return stop(); }
     if (!q.dry && doneToday() >= st.dailyMax) { log(`今日の上限 ${st.dailyMax}件 に達したので一時停止。明日「続きから」を押してください`); q.running = false; S.set('queue', q); return; }
     const wait = q.dry ? 3 : st.waitMin + Math.random() * (st.waitMax - st.waitMin);
-    log(`${Math.round(wait)}秒待って次へ（${q.pos + 1}/${q.items.length}）`);
+    log(`⏳ ${Math.round(wait)}秒待って次へ（${q.pos + 1}/${q.items.length}）${q.items[q.pos].name}`);
     q.nextAt = Date.now() + wait * 1000;
     S.set('queue', q);
     goNextWhenReady();
@@ -181,6 +217,7 @@
       for (;;) {
         const q = S.get('queue', null);
         if (!q || !q.running) return;
+        if (q.pending && finishPendingIfDone(q, null)) return;
         const cur = q.items[q.pos];
         if (!cur || location.pathname.includes(`/sell/edit/${cur.id}`)) return;
         if (Date.now() >= (q.nextAt || 0)) { location.href = `https://jp.mercari.com/sell/edit/${cur.id}`; return; }
@@ -257,7 +294,7 @@
               const n = newPrice(r.price, st);
               return `<label style="display:block;border-bottom:1px solid #f3f3f3;${n ? '' : 'color:#aaa'}">
                 <input type="checkbox" class="mn-row" data-i="${i}" ${r.checked ? 'checked' : ''} ${n ? '' : 'disabled'}>
-                ${r.price.toLocaleString()}円 → <b>${n ? n.toLocaleString() + '円' : '下げない'}</b> ${r.paused ? '<span style="color:#999">[停止中]</span> ' : ''}${escapeHtml(r.name)}</label>`;
+                ${r.price.toLocaleString()}円 → <b>${n ? n.toLocaleString() + '円' : '下げない'}</b> ${r.lastDown ? `<span style="color:#0a7d2c">[${r.lastDown} 値下げ済]</span> ` : ''}${escapeHtml(r.name)}</label>`;
             }).join('')}
           </div>
           <button id="mn-dry" style="width:49%;margin-top:6px;padding:6px">③ 試し（保存しない）</button>
@@ -293,7 +330,9 @@
       // 一覧は新しい順なので、古い順に並べ替える
       rows.reverse();
       const active = rows.filter((r) => !r.paused);
-      S.set('preview', active.map((r) => ({ ...r, checked: false })));
+      const hist = S.get('history', []);
+      const lastOf = (id) => { const h = hist.filter((x) => x.id === id).pop(); return h ? mmdd(new Date(h.at)) : ''; };
+      S.set('preview', active.map((r) => ({ ...r, checked: false, lastDown: lastOf(r.id) })));
       log(`出品中 ${active.length}件を読み込みました（停止中 ${rows.length - active.length}件は出していません）`);
       renderPanel();
     });
