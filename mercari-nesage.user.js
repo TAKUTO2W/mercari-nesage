@@ -1,0 +1,302 @@
+// ==UserScript==
+// @name         メルカリ一括値下げ
+// @namespace    usdm.mercari.nesage
+// @version      0.2.0
+// @description  出品中の商品を、決めた率・金額で1品ずつ順番に値下げする
+// @match        https://jp.mercari.com/*
+// @updateURL    https://raw.githubusercontent.com/TAKUTO2W/mercari-nesage/main/mercari-nesage.user.js
+// @downloadURL  https://raw.githubusercontent.com/TAKUTO2W/mercari-nesage/main/mercari-nesage.user.js
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ---------- 保存まわり ----------
+  const DEFAULTS = {
+    mode: 'percent',   // percent | yen
+    percent: 3,
+    yen: 100,
+    unit: 10,          // 端数をそろえる単位（切り捨て）
+    floor: 300,        // これより下げない
+    dailyMax: 50,      // 1日の上限件数
+    waitMin: 40,       // 1品ごとの待ち（秒）最小
+    waitMax: 90,       // 最大
+  };
+  const S = {
+    get: (k, d) => { const v = GM_getValue(k); return v === undefined ? d : v; },
+    set: (k, v) => GM_setValue(k, v),
+  };
+  const settings = () => Object.assign({}, DEFAULTS, S.get('settings', {}));
+  const today = () => new Date().toLocaleDateString('sv-SE'); // YYYY-MM-DD
+  const doneToday = () => (S.get('dayCount', {})[today()] || 0);
+  const addDoneToday = () => { const m = S.get('dayCount', {}); m[today()] = (m[today()] || 0) + 1; S.set('dayCount', m); };
+  const log = (msg) => {
+    const l = S.get('log', []);
+    l.push(`${new Date().toLocaleString('ja-JP')} ${msg}`);
+    S.set('log', l.slice(-500));
+    console.log('[一括値下げ]', msg);
+    renderLog();
+  };
+
+  // ---------- 値段の計算 ----------
+  function newPrice(p, st) {
+    let n = st.mode === 'percent' ? p * (1 - st.percent / 100) : p - st.yen;
+    const unit = Math.max(1, Number(st.unit) || 1);
+    n = Math.floor(n / unit) * unit;
+    n = Math.max(n, Number(st.floor) || 300, 300);
+    return n < p ? n : null; // 下がらないなら null（飛ばす）
+  }
+
+  // ---------- 小道具 ----------
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function waitFor(fn, timeout = 20000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) { const v = fn(); if (v) return v; await sleep(300); }
+    return null;
+  }
+  const yenToNum = (s) => Number(String(s).replace(/[^0-9]/g, '')) || 0;
+  function setReactValue(input, value) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(input, String(value));
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  // ---------- 出品一覧の読み取り ----------
+  // 出品中の一覧（/mypage/listings）から 商品ID・名前・値段 を集める
+  function readListingRows() {
+    const rows = [];
+    const seen = new Set();
+    document.querySelectorAll('a[href*="/item/m"]').forEach((a) => {
+      const m = a.getAttribute('href').match(/\/item\/(m\d+)/);
+      if (!m || seen.has(m[1])) return;
+      seen.add(m[1]);
+      const text = a.innerText || '';
+      const priceMatch = text.match(/[¥￥]\s*([\d,]+)/);
+      const price = priceMatch ? yenToNum(priceMatch[1]) : 0;
+      const name = (text.split('\n').map((t) => t.trim()).find((t) => t && !/[¥￥]/.test(t)) || '');
+      const box = a.parentElement?.parentElement?.innerText || '';
+      const paused = /公開停止中/.test(box);
+      rows.push({ id: m[1], name: name.slice(0, 60), price, paused });
+    });
+    return rows;
+  }
+
+  async function loadAllListings(status) {
+    // 「もっと見る」を押せるだけ押す／一番下までスクロールする
+    for (let i = 0; i < 200; i++) {
+      const before = readListingRows().length;
+      const more = [...document.querySelectorAll('button')].find((b) => /もっと見る/.test(b.innerText));
+      if (more) more.click(); else window.scrollTo(0, document.body.scrollHeight);
+      await sleep(1500);
+      const after = readListingRows().length;
+      status(`読み込み中… ${after}件`);
+      if (after === before && !more) break;
+    }
+    return readListingRows();
+  }
+
+  // ---------- 編集画面での値下げ ----------
+  async function runOnEditPage() {
+    const q = S.get('queue', null);
+    if (!q || !q.running) return;
+    const cur = q.items[q.pos];
+    if (!cur || !location.pathname.includes(`/sell/edit/${cur.id}`)) return;
+
+    const st = settings();
+    const input = await waitFor(() => document.querySelector('input[data-testid="price-text-input"], input[name="price"]'));
+    if (!input) { log(`${cur.id} 値段の入力欄が見つからないので止めました`); return stop(); }
+    await sleep(1000);
+    if (document.querySelector('[data-testid="auction-price-option"]')?.checked) { log(`${cur.id} オークション形式なので飛ばし`); return next(q, false); }
+    const actual = yenToNum(input.value);
+    const target = newPrice(actual, st);
+    if (!target) { log(`${cur.id} ${actual}円 → 下限のため飛ばし`); return next(q, false); }
+    if (q.dry) { log(`[試し] ${cur.id} ${cur.name} ${actual}円 → ${target}円（保存はしていません）`); return next(q, false); }
+    setReactValue(input, target);
+    await sleep(800 + Math.random() * 800);
+
+    const btn = document.querySelector('button[data-testid="edit-button"]')
+      || [...document.querySelectorAll('button')].find((b) => /^(変更する|更新する)$/.test(b.innerText.trim()));
+    if (!btn) { log(`${cur.id} 「変更する」ボタンが見つからないので止めました`); return stop(); }
+    btn.click();
+    const ok = await waitFor(() => !location.pathname.includes('/sell/edit/'), 20000);
+    if (!ok) { log(`${cur.id} 保存できたか確認できないので止めました`); return stop(); }
+    addDoneToday();
+    log(`${cur.id} ${cur.name} ${actual}円 → ${target}円`);
+    S.set('history', [...S.get('history', []), { id: cur.id, from: actual, to: target, at: new Date().toISOString() }].slice(-5000));
+    return next(q, true);
+  }
+
+  async function next(q, saved) {
+    q.pos += 1;
+    S.set('queue', q);
+    const st = settings();
+    if (q.pos >= q.items.length) { log(`終わりました（${q.items.length}件）`); return stop(); }
+    if (!q.dry && doneToday() >= st.dailyMax) { log(`今日の上限 ${st.dailyMax}件 に達したので一時停止。明日「続きから」を押してください`); q.running = false; S.set('queue', q); return; }
+    const wait = q.dry ? 3 : st.waitMin + Math.random() * (st.waitMax - st.waitMin);
+    log(`${Math.round(wait)}秒待って次へ（${q.pos + 1}/${q.items.length}）`);
+    q.nextAt = Date.now() + wait * 1000;
+    S.set('queue', q);
+    goNextWhenReady();
+  }
+
+  // 実行中なら、待ち時間が来たら次の商品の編集画面へ（ページが読み直されても続く）
+  let goingNext = false;
+  async function goNextWhenReady() {
+    if (goingNext) return;
+    goingNext = true;
+    try {
+      for (;;) {
+        const q = S.get('queue', null);
+        if (!q || !q.running) return;
+        const cur = q.items[q.pos];
+        if (!cur || location.pathname.includes(`/sell/edit/${cur.id}`)) return;
+        if (Date.now() >= (q.nextAt || 0)) { location.href = `https://jp.mercari.com/sell/edit/${cur.id}`; return; }
+        await sleep(1000);
+      }
+    } finally { goingNext = false; }
+  }
+
+  function stop() {
+    const q = S.get('queue', null);
+    if (q) { q.running = false; S.set('queue', q); }
+    renderPanel();
+  }
+
+  function start(dry, resume) {
+    let q = S.get('queue', null);
+    if (!resume) {
+      const items = S.get('preview', []).filter((r) => r.checked);
+      if (!items.length) return alert('値下げする商品が選ばれていません');
+      q = { items, pos: 0, dry, running: true };
+    } else {
+      if (!q) return alert('続きがありません');
+      q.running = true;
+    }
+    S.set('queue', q);
+    location.href = `https://jp.mercari.com/sell/edit/${q.items[q.pos].id}`;
+  }
+
+  // ---------- 画面のパネル ----------
+  let panel;
+  function renderLog() {
+    const el = panel?.querySelector('#mn-log');
+    if (el) { el.textContent = S.get('log', []).slice(-30).join('\n'); el.scrollTop = el.scrollHeight; }
+  }
+  function renderPanel() {
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'mn-panel';
+      panel.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:99999;width:380px;max-height:80vh;overflow:auto;background:#fff;border:2px solid #e60012;border-radius:8px;padding:10px;font:13px/1.5 sans-serif;color:#222;box-shadow:0 4px 16px rgba(0,0,0,.2)';
+      document.body.appendChild(panel);
+    }
+    const st = settings();
+    const q = S.get('queue', null);
+    const preview = S.get('preview', []);
+    const onList = location.pathname.startsWith('/mypage/listings');
+    const running = q && q.running;
+    panel.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <b>一括値下げ</b><button id="mn-min" style="border:0;background:none;cursor:pointer">－</button>
+      </div>
+      <div id="mn-body">
+        <div>今日の値下げ: ${doneToday()} / ${st.dailyMax}件</div>
+        ${q ? `<div>進み具合: ${q.pos}/${q.items.length}件 ${q.dry ? '（試し）' : ''} ${running ? '<b style="color:#e60012">実行中</b>' : '停止中'}</div>` : ''}
+        ${running ? '<button id="mn-stop" style="width:100%;margin:6px 0;padding:6px;background:#333;color:#fff;border:0;border-radius:4px">止める</button>' : ''}
+        ${!running ? `
+        <fieldset style="margin:6px 0;border:1px solid #ddd;padding:6px">
+          <label><input type="radio" name="mn-mode" value="percent" ${st.mode === 'percent' ? 'checked' : ''}> 率</label>
+          ${[3, 5, 7, 10].map((p) => `<button class="mn-p" data-p="${p}" style="margin:0 2px;${st.mode === 'percent' && st.percent === p ? 'background:#e60012;color:#fff' : ''}">${p}%</button>`).join('')}
+          <input id="mn-percent" type="number" value="${st.percent}" style="width:48px">%<br>
+          <label><input type="radio" name="mn-mode" value="yen" ${st.mode === 'yen' ? 'checked' : ''}> 金額</label>
+          <input id="mn-yen" type="number" value="${st.yen}" style="width:70px">円 下げる<br>
+          端数 <input id="mn-unit" type="number" value="${st.unit}" style="width:50px">円単位で切り捨て<br>
+          下限 <input id="mn-floor" type="number" value="${st.floor}" style="width:70px">円（これより下げない）<br>
+          1日の上限 <input id="mn-daily" type="number" value="${st.dailyMax}" style="width:50px">件<br>
+          間隔 <input id="mn-wmin" type="number" value="${st.waitMin}" style="width:44px">〜<input id="mn-wmax" type="number" value="${st.waitMax}" style="width:44px">秒
+        </fieldset>
+        ${onList ? '<button id="mn-load" style="width:100%;padding:6px">① 出品中の商品を読み込む</button>' : '<div><a href="/mypage/listings">出品した商品の画面</a>で読み込みます</div>'}
+        <div id="mn-status" style="color:#666"></div>
+        ${preview.length ? `
+          <div style="margin-top:6px">② 確認（${preview.filter((r) => r.checked).length}/${preview.length}件 選択）
+            <span style="float:right"><button id="mn-all-on">全部選ぶ</button> <button id="mn-all-off">全部外す</button></span></div>
+          <div style="max-height:200px;overflow:auto;border:1px solid #eee">
+            ${preview.map((r, i) => {
+              const n = newPrice(r.price, st);
+              return `<label style="display:block;border-bottom:1px solid #f3f3f3;${n ? '' : 'color:#aaa'}">
+                <input type="checkbox" class="mn-row" data-i="${i}" ${r.checked ? 'checked' : ''} ${n ? '' : 'disabled'}>
+                ${r.price.toLocaleString()}円 → <b>${n ? n.toLocaleString() + '円' : '下げない'}</b> ${r.paused ? '<span style="color:#999">[停止中]</span> ' : ''}${escapeHtml(r.name)}</label>`;
+            }).join('')}
+          </div>
+          <button id="mn-dry" style="width:49%;margin-top:6px;padding:6px">③ 試し（保存しない）</button>
+          <button id="mn-run" style="width:49%;margin-top:6px;padding:6px;background:#e60012;color:#fff;border:0;border-radius:4px">③ 値下げ開始</button>` : ''}
+        ${q && !running && q.pos < q.items.length ? '<button id="mn-resume" style="width:100%;margin-top:6px;padding:6px">続きから</button>' : ''}
+        ` : ''}
+        <pre id="mn-log" style="margin-top:6px;max-height:140px;overflow:auto;background:#f7f7f7;padding:4px;white-space:pre-wrap;font-size:11px"></pre>
+      </div>`;
+    renderLog();
+    bind();
+  }
+  function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+  function saveSettingsFromPanel() {
+    const v = (id) => Number(panel.querySelector(id)?.value);
+    const mode = panel.querySelector('input[name="mn-mode"]:checked')?.value || 'percent';
+    S.set('settings', {
+      mode, percent: v('#mn-percent'), yen: v('#mn-yen'), unit: v('#mn-unit'), floor: v('#mn-floor'),
+      dailyMax: v('#mn-daily'), waitMin: v('#mn-wmin'), waitMax: Math.max(v('#mn-wmin'), v('#mn-wmax')),
+    });
+  }
+
+  function bind() {
+    const $ = (s) => panel.querySelector(s);
+    $('#mn-min').onclick = () => { const b = $('#mn-body'); b.style.display = b.style.display === 'none' ? '' : 'none'; };
+    $('#mn-stop') && ($('#mn-stop').onclick = () => { log('止めました'); stop(); });
+    panel.querySelectorAll('fieldset input').forEach((el) => { el.onchange = () => { saveSettingsFromPanel(); renderPanel(); }; });
+    panel.querySelectorAll('.mn-p').forEach((b) => {
+      b.onclick = () => { saveSettingsFromPanel(); S.set('settings', { ...settings(), mode: 'percent', percent: Number(b.dataset.p) }); renderPanel(); };
+    });
+    $('#mn-load') && ($('#mn-load').onclick = async () => {
+      const rows = await loadAllListings((t) => { $('#mn-status').textContent = t; });
+      // 一覧は新しい順なので、古い順に並べ替える
+      rows.reverse();
+      S.set('preview', rows.map((r) => ({ ...r, checked: !r.paused && !!newPrice(r.price, settings()) })));
+      log(`出品中 ${rows.length}件を読み込みました`);
+      renderPanel();
+    });
+    const setAll = (on) => {
+      const st = settings();
+      S.set('preview', S.get('preview', []).map((r) => ({ ...r, checked: on && !r.paused && !!newPrice(r.price, st) })));
+      renderPanel();
+    };
+    $('#mn-all-on') && ($('#mn-all-on').onclick = () => setAll(true));
+    $('#mn-all-off') && ($('#mn-all-off').onclick = () => setAll(false));
+    panel.querySelectorAll('.mn-row').forEach((c) => {
+      c.onchange = () => { const p = S.get('preview', []); p[c.dataset.i].checked = c.checked; S.set('preview', p); renderPanel(); };
+    });
+    $('#mn-dry') && ($('#mn-dry').onclick = () => start(true, false));
+    // 確認は小窓（confirm）を使わず、ボタンを2回押す形にする
+    $('#mn-run') && ($('#mn-run').onclick = (e) => {
+      const b = e.currentTarget;
+      const n = S.get('preview', []).filter((r) => r.checked).length;
+      if (b.dataset.armed) return start(false, false);
+      b.dataset.armed = '1';
+      b.textContent = `${n}件を値下げ。もう一度押すと開始`;
+      setTimeout(() => { if (b.isConnected) { delete b.dataset.armed; b.textContent = '③ 値下げ開始'; } }, 8000);
+    });
+    $('#mn-resume') && ($('#mn-resume').onclick = () => start(S.get('queue', {}).dry, true));
+  }
+
+  // ---------- 起動 ----------
+  let lastPath = '';
+  setInterval(() => {
+    if (location.pathname === lastPath) return;
+    lastPath = location.pathname;
+    renderPanel();
+    if (location.pathname.startsWith('/sell/edit/')) runOnEditPage(); else goNextWhenReady();
+  }, 1000);
+})();
