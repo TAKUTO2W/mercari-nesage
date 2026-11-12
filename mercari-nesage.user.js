@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         メルカリ一括値下げ
 // @namespace    usdm.mercari.nesage
-// @version      0.2.0
+// @version      0.3.0
 // @description  出品中の商品を、決めた率・金額で1品ずつ順番に値下げする
 // @match        https://jp.mercari.com/*
 // @updateURL    https://raw.githubusercontent.com/TAKUTO2W/mercari-nesage/main/mercari-nesage.user.js
@@ -23,8 +23,8 @@
     unit: 10,          // 端数をそろえる単位（切り捨て）
     floor: 300,        // これより下げない
     dailyMax: 50,      // 1日の上限件数
-    waitMin: 40,       // 1品ごとの待ち（秒）最小
-    waitMax: 90,       // 最大
+    waitMin: 15,       // 1品ごとの待ち（秒）最小
+    waitMax: 25,       // 最大
   };
   const S = {
     get: (k, d) => { const v = GM_getValue(k); return v === undefined ? d : v; },
@@ -100,6 +100,28 @@
     return readListingRows();
   }
 
+  // 「画像は自分で撮影・作成しました」の確認欄があればチェックを入れる。入れたら true
+  async function checkPhotoConfirm() {
+    const label = [...document.querySelectorAll('label, span, p, div')]
+      .find((el) => el.children.length <= 3 && /画像は自分で撮影・作成しました/.test(el.textContent || '') && (el.textContent || '').length < 60);
+    if (!label) return false;
+    let box = label.querySelector('input[type="checkbox"]');
+    // 近く（4段上まで）にあるチェック欄だけを見る。別の欄を押さないため
+    let el = label;
+    for (let i = 0; !box && el && i < 4; i++, el = el.parentElement) {
+      const boxes = el.querySelectorAll('input[type="checkbox"]');
+      if (boxes.length === 1) box = boxes[0];
+      if (boxes.length > 1) break;
+    }
+    if (!box || box.checked) return false;
+    box.click();
+    await sleep(500);
+    if (!box.checked) label.click();
+    await sleep(300);
+    log('「画像は自分で撮影・作成しました」にチェックを入れました');
+    return box.checked;
+  }
+
   // ---------- 編集画面での値下げ ----------
   async function runOnEditPage() {
     const q = S.get('queue', null);
@@ -122,8 +144,14 @@
     const btn = document.querySelector('button[data-testid="edit-button"]')
       || [...document.querySelectorAll('button')].find((b) => /^(変更する|更新する)$/.test(b.innerText.trim()));
     if (!btn) { log(`${cur.id} 「変更する」ボタンが見つからないので止めました`); return stop(); }
+    await checkPhotoConfirm();
     btn.click();
-    const ok = await waitFor(() => !location.pathname.includes('/sell/edit/'), 20000);
+    let ok = await waitFor(() => !location.pathname.includes('/sell/edit/'), 8000);
+    if (!ok && await checkPhotoConfirm()) { // 押した後に確認欄が出た場合はチェックしてもう一度
+      await sleep(800);
+      btn.click();
+    }
+    ok = ok || await waitFor(() => !location.pathname.includes('/sell/edit/'), 15000);
     if (!ok) { log(`${cur.id} 保存できたか確認できないので止めました`); return stop(); }
     addDoneToday();
     log(`${cur.id} ${cur.name} ${actual}円 → ${target}円`);
@@ -264,8 +292,9 @@
       const rows = await loadAllListings((t) => { $('#mn-status').textContent = t; });
       // 一覧は新しい順なので、古い順に並べ替える
       rows.reverse();
-      S.set('preview', rows.map((r) => ({ ...r, checked: !r.paused && !!newPrice(r.price, settings()) })));
-      log(`出品中 ${rows.length}件を読み込みました`);
+      const active = rows.filter((r) => !r.paused);
+      S.set('preview', active.map((r) => ({ ...r, checked: false })));
+      log(`出品中 ${active.length}件を読み込みました（停止中 ${rows.length - active.length}件は出していません）`);
       renderPanel();
     });
     const setAll = (on) => {
@@ -292,6 +321,10 @@
   }
 
   // ---------- 起動 ----------
+  // 開いたときは何も選ばれていない状態から始める（実行中は除く）
+  if (!S.get('queue', {})?.running) {
+    S.set('preview', S.get('preview', []).filter((r) => !r.paused).map((r) => ({ ...r, checked: false })));
+  }
   let lastPath = '';
   setInterval(() => {
     if (location.pathname === lastPath) return;
