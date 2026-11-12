@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         メルカリ一括値下げ
 // @namespace    usdm.mercari.nesage
-// @version      0.4.0
+// @version      0.5.0
 // @description  出品中の商品を、決めた率・金額で1品ずつ順番に値下げする
 // @match        https://jp.mercari.com/*
 // @updateURL    https://raw.githubusercontent.com/TAKUTO2W/mercari-nesage/main/mercari-nesage.user.js
@@ -23,13 +23,12 @@
     unit: 10,          // 端数をそろえる単位（切り捨て）
     floor: 300,        // これより下げない
     dailyMax: 50,      // 1日の上限件数
-    waitMin: 10,       // 1品ごとの待ち（秒）最小
-    waitMax: 20,       // 最大
   };
   const S = {
     get: (k, d) => { const v = GM_getValue(k); return v === undefined ? d : v; },
     set: (k, v) => GM_setValue(k, v),
   };
+  const WAIT_SEC = 10; // 1品ごとの間隔（秒）。固定
   const settings = () => Object.assign({}, DEFAULTS, S.get('settings', {}));
   const today = () => new Date().toLocaleDateString('sv-SE'); // YYYY-MM-DD
   const mmdd = (d = new Date()) => `${d.getMonth() + 1}/${d.getDate()}`;
@@ -123,6 +122,11 @@
     return box.checked;
   }
 
+  function allowLeave() {
+    window.addEventListener('beforeunload', (e) => { e.stopImmediatePropagation(); }, true);
+    try { window.onbeforeunload = null; } catch (_) { /* 何もしない */ }
+  }
+
   // ---------- 編集画面での値下げ ----------
   // 値下げが済んだときの記録：ログ・履歴・確認一覧の値段と日付を新しくする
   function markDone(cur, from, to) {
@@ -178,16 +182,26 @@
     q.pending = { id: cur.id, from: actual, to: target };
     S.set('queue', q);
     btn.click();
-    let ok = await waitFor(() => !location.pathname.includes('/sell/edit/'), 8000);
+    const left = () => !location.pathname.includes('/sell/edit/');
+    let ok = await waitFor(left, 8000);
     if (!ok && await checkPhotoConfirm()) { // 押した後に確認欄が出た場合はチェックしてもう一度
       await sleep(800);
       btn.click();
+      ok = await waitFor(left, 10000);
     }
-    ok = ok || await waitFor(() => !location.pathname.includes('/sell/edit/'), 15000);
+    if (!ok) ok = await waitFor(left, 4000);
     if (!ok) {
+      // 赤字の注意（例: ストレージ容量を選択してください）が出て保存できない → 値段を戻して飛ばす
+      const why = [...document.querySelectorAll('p, span, div')]
+        .filter((el) => el.children.length === 0 && (el.textContent || '').trim() !== '選択してください'
+          && /(選択|入力)してください/.test(el.textContent || '') && (el.textContent || '').length < 40)
+        .map((el) => el.textContent.trim());
       delete q.pending; S.set('queue', q);
-      log(`❌ ${head} 保存できたか確認できないので止めました（今 ${actual.toLocaleString()}円のまま）`);
-      return stop();
+      setReactValue(input, actual);
+      allowLeave();
+      log(`⏭ 飛ばし ${head}　保存できませんでした${why.length ? '（' + [...new Set(why)].slice(0, 3).join('／') + '）' : ''}。値段は${actual.toLocaleString()}円のまま　https://jp.mercari.com/sell/edit/${cur.id}`);
+      const sk = S.get('skipped', []); sk.push({ id: cur.id, name: cur.name, why, at: new Date().toISOString() }); S.set('skipped', sk.slice(-1000));
+      return next(q, false);
     }
     delete q.pending;
     S.set('queue', q);
@@ -201,7 +215,7 @@
     const st = settings();
     if (q.pos >= q.items.length) { log(`🏁 全部終わりました（${q.items.length}件）`); return stop(); }
     if (!q.dry && doneToday() >= st.dailyMax) { log(`今日の上限 ${st.dailyMax}件 に達したので一時停止。明日「続きから」を押してください`); q.running = false; S.set('queue', q); return; }
-    const wait = q.dry ? 3 : st.waitMin + Math.random() * (st.waitMax - st.waitMin);
+    const wait = q.dry ? 3 : WAIT_SEC;
     log(`⏳ ${Math.round(wait)}秒待って次へ（${q.pos + 1}/${q.items.length}）${q.items[q.pos].name}`);
     q.nextAt = Date.now() + wait * 1000;
     S.set('queue', q);
@@ -281,8 +295,7 @@
           <input id="mn-yen" type="number" value="${st.yen}" style="width:70px">円 下げる<br>
           端数 <input id="mn-unit" type="number" value="${st.unit}" style="width:50px">円単位で切り捨て<br>
           下限 <input id="mn-floor" type="number" value="${st.floor}" style="width:70px">円（これより下げない）<br>
-          1日の上限 <input id="mn-daily" type="number" value="${st.dailyMax}" style="width:50px">件<br>
-          間隔 <input id="mn-wmin" type="number" value="${st.waitMin}" style="width:44px">〜<input id="mn-wmax" type="number" value="${st.waitMax}" style="width:44px">秒
+          1日の上限 <input id="mn-daily" type="number" value="${st.dailyMax}" style="width:50px">件（間隔は${WAIT_SEC}秒）
         </fieldset>
         ${onList ? '<button id="mn-load" style="width:100%;padding:6px">① 出品中の商品を読み込む</button>' : '<div><a href="/mypage/listings">出品した商品の画面</a>で読み込みます</div>'}
         <div id="mn-status" style="color:#666"></div>
@@ -313,7 +326,7 @@
     const mode = panel.querySelector('input[name="mn-mode"]:checked')?.value || 'percent';
     S.set('settings', {
       mode, percent: v('#mn-percent'), yen: v('#mn-yen'), unit: v('#mn-unit'), floor: v('#mn-floor'),
-      dailyMax: v('#mn-daily'), waitMin: v('#mn-wmin'), waitMax: Math.max(v('#mn-wmin'), v('#mn-wmax')),
+      dailyMax: v('#mn-daily'),
     });
   }
 
