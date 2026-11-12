@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         メルカリ一括値下げ
 // @namespace    usdm.mercari.nesage
-// @version      0.5.0
+// @version      0.6.0
 // @description  出品中の商品を、決めた率・金額で1品ずつ順番に値下げする
 // @match        https://jp.mercari.com/*
 // @updateURL    https://raw.githubusercontent.com/TAKUTO2W/mercari-nesage/main/mercari-nesage.user.js
@@ -22,14 +22,19 @@
     yen: 100,
     unit: 10,          // 端数をそろえる単位（切り捨て）
     floor: 300,        // これより下げない
-    dailyMax: 50,      // 1日の上限件数
+    dailyMax: 500,     // 1日の上限件数
   };
   const S = {
     get: (k, d) => { const v = GM_getValue(k); return v === undefined ? d : v; },
     set: (k, v) => GM_setValue(k, v),
   };
-  const WAIT_SEC = 10; // 1品ごとの間隔（秒）。固定
+  const WAIT_SEC = 15; // 1品ごとの間隔（秒）。固定
   const settings = () => Object.assign({}, DEFAULTS, S.get('settings', {}));
+  if (!S.get('migrated060', false)) {
+    const sv = S.get('settings', {});
+    if (sv.dailyMax === 50) { sv.dailyMax = 500; S.set('settings', sv); }
+    S.set('migrated060', true);
+  }
   const today = () => new Date().toLocaleDateString('sv-SE'); // YYYY-MM-DD
   const mmdd = (d = new Date()) => `${d.getMonth() + 1}/${d.getDate()}`;
   const doneToday = () => (S.get('dayCount', {})[today()] || 0);
@@ -210,10 +215,16 @@
   }
 
   async function next(q, saved) {
+    if (q.dry || saved) q.ok = (q.ok || 0) + 1; else q.skip = (q.skip || 0) + 1;
     q.pos += 1;
     S.set('queue', q);
     const st = settings();
-    if (q.pos >= q.items.length) { log(`🏁 全部終わりました（${q.items.length}件）`); return stop(); }
+    if (q.pos >= q.items.length) {
+      q.result = `完了！ 全${q.items.length}件中 ${q.ok || 0}件 ${q.dry ? '計算OK（試し）' : '値下げ成功'}・${q.skip || 0}件 飛ばし`;
+      S.set('queue', q);
+      log(`🏁 ${q.result}`);
+      return stop();
+    }
     if (!q.dry && doneToday() >= st.dailyMax) { log(`今日の上限 ${st.dailyMax}件 に達したので一時停止。明日「続きから」を押してください`); q.running = false; S.set('queue', q); return; }
     const wait = q.dry ? 3 : WAIT_SEC;
     log(`⏳ ${Math.round(wait)}秒待って次へ（${q.pos + 1}/${q.items.length}）${q.items[q.pos].name}`);
@@ -251,7 +262,7 @@
     if (!resume) {
       const items = S.get('preview', []).filter((r) => r.checked);
       if (!items.length) return alert('値下げする商品が選ばれていません');
-      q = { items, pos: 0, dry, running: true };
+      q = { items, pos: 0, dry, running: true, ok: 0, skip: 0 };
     } else {
       if (!q) return alert('続きがありません');
       q.running = true;
@@ -270,7 +281,7 @@
     if (!panel) {
       panel = document.createElement('div');
       panel.id = 'mn-panel';
-      panel.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:99999;width:380px;max-height:80vh;overflow:auto;background:#fff;border:2px solid #e60012;border-radius:8px;padding:10px;font:13px/1.5 sans-serif;color:#222;box-shadow:0 4px 16px rgba(0,0,0,.2)';
+      panel.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:99999;width:min(560px,calc(100vw - 24px));max-height:90vh;overflow:auto;background:#fff;border:2px solid #e60012;border-radius:8px;padding:10px;font:13px/1.5 sans-serif;color:#222;box-shadow:0 4px 16px rgba(0,0,0,.2)';
       document.body.appendChild(panel);
     }
     const st = settings();
@@ -284,7 +295,8 @@
       </div>
       <div id="mn-body">
         <div>今日の値下げ: ${doneToday()} / ${st.dailyMax}件</div>
-        ${q ? `<div>進み具合: ${q.pos}/${q.items.length}件 ${q.dry ? '（試し）' : ''} ${running ? '<b style="color:#e60012">実行中</b>' : '停止中'}</div>` : ''}
+        ${q && q.result && !running ? `<div style="margin:6px 0;padding:10px;background:#e8f7ee;border:2px solid #0a7d2c;border-radius:6px;color:#0a7d2c;font-size:16px;font-weight:bold;text-align:center">🎉 ${q.result}</div>` : ''}
+        ${q ? `<div>進み具合: ${q.pos}/${q.items.length}件（成功 ${q.ok || 0}・飛ばし ${q.skip || 0}） ${q.dry ? '（試し）' : ''} ${running ? '<b style="color:#e60012">実行中</b>' : '停止中'}</div>` : ''}
         ${running ? '<button id="mn-stop" style="width:100%;margin:6px 0;padding:6px;background:#333;color:#fff;border:0;border-radius:4px">止める</button>' : ''}
         ${!running ? `
         <fieldset style="margin:6px 0;border:1px solid #ddd;padding:6px">
@@ -302,7 +314,7 @@
         ${preview.length ? `
           <div style="margin-top:6px">② 確認（${preview.filter((r) => r.checked).length}/${preview.length}件 選択）
             <span style="float:right"><button id="mn-all-on">全部選ぶ</button> <button id="mn-all-off">全部外す</button></span></div>
-          <div style="max-height:200px;overflow:auto;border:1px solid #eee">
+          <div style="max-height:45vh;overflow:auto;border:1px solid #eee">
             ${preview.map((r, i) => {
               const n = newPrice(r.price, st);
               return `<label style="display:block;border-bottom:1px solid #f3f3f3;${n ? '' : 'color:#aaa'}">
